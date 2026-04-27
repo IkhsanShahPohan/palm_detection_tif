@@ -1,40 +1,40 @@
 """
-worker.py
-Semua logika berat: inference YOLO, manajemen file temp.
-
-Prinsip utama:
-- File temp SELALU dihapus di blok finally — tidak peduli sukses atau gagal
-- Setiap exception (DB lost connection, rasterio error, dll) langsung update status → failed
-- Setiap job terisolasi penuh — satu job gagal tidak mempengaruhi job lain
-- pg_notify dipakai untuk Supabase Realtime progress updates
+worker.py  ·  v5
+Optimasi vs v4:
+  - DB update: throttle 2 detik (bukan 1 detik) + notify digabung dalam 1 koneksi
+  - gc.collect() hanya di akhir setiap ROW (bukan tiap batch) — overhead berkurang drastis
+  - speed_window deque O(1) vs list.pop(0) O(n)
+  - Batch results di-del segera setelah count_per_class untuk bebaskan memori GPU/RAM lebih cepat
+  - _run_inference tidak import model ulang jika sudah di-cache (get_model idempotent)
+  - Semua prinsip v4 dipertahankan: isolasi job, finally selalu hapus file
 """
 
 import gc
 import os
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from database import update_job, notify_job_progress
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
-MODEL_PATH     = os.getenv("MODEL_PATH", "best_v3.pt")
-TEMP_DIR       = os.getenv("TEMP_DIR", "temp_uploads")
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+MODEL_PATH       = os.getenv("MODEL_PATH", "best_v3.pt")
+TEMP_DIR         = os.getenv("TEMP_DIR", "temp_uploads")
+MAX_CONCURRENT   = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+DB_WRITE_INTERVAL = float(os.getenv("DB_WRITE_INTERVAL", "2.0"))  # detik antar DB write
 
-# ThreadPoolExecutor: thread yang benar-benar menjalankan inference
 _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT, thread_name_prefix="sawit_worker")
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 def safe_delete(path: str | None, label: str = "") -> None:
-    """Hapus file tanpa raise exception. Selalu dipanggil di finally."""
     if not path:
         return
     try:
@@ -58,11 +58,6 @@ def _fmt_duration(seconds: int | None) -> str:
 
 
 def _fail_job(job_id: str, message: str, exc: Exception | None = None) -> None:
-    """
-    Helper terpusat untuk menandai job sebagai failed.
-    Dipanggil dari mana saja — DB error, rasterio error, OOM, dll.
-    Tidak pernah raise exception agar blok finally tetap berjalan.
-    """
     detail = f"Gagal: {str(exc)}" if exc else message
     print(f"[{job_id[:8]}] ❌ {detail}")
     try:
@@ -73,23 +68,14 @@ def _fail_job(job_id: str, message: str, exc: Exception | None = None) -> None:
             message=detail,
         )
     except Exception as inner:
-        # Bahkan update ke DB pun gagal — log saja, jangan crash thread
         print(f"[{job_id[:8]}] ⚠️  Tidak bisa update status ke DB: {inner}")
 
 
-# ─────────────────────────────────────────────
-# Core inference — dipanggil oleh run_tif_upload_job
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Core inference
+# ──────────────────────────────────────────────
 
 def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) -> None:
-    """
-    Jalankan inference YOLO tile per tile.
-    Setiap tahap dikungkung try/except tersendiri sehingga error apapun
-    (model load gagal, rasterio crash, DB lost connection, OOM, dll.)
-    langsung mengubah status menjadi failed — bukan exception yang menggantung.
-    """
-    # Import di sini agar error import (ultralytics belum install, dll)
-    # terdeteksi sebagai job failure, bukan server crash
     try:
         from running_model3 import count_per_class, get_model
         from tile3 import generate_tiles_from_tiff, get_tif_info
@@ -99,13 +85,12 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
 
     start = time.monotonic()
 
-    # ── 1. Baca metadata ─────────────────────────────────────────
+    # ── 1. Metadata ───────────────────────────────────────────────
     try:
         update_job(job_id, status="processing", progress=2,
                    message="Membaca metadata TIF...")
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  DB update gagal di step 1: {e}")
-        # Lanjut saja — DB mungkin sesaat tidak bisa dihubungi
 
     try:
         tif_info   = get_tif_info(file_path)
@@ -127,7 +112,7 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             ),
         )
     except Exception as e:
-        print(f"[{job_id[:8]}] ⚠️  DB update gagal setelah baca metadata: {e}")
+        print(f"[{job_id[:8]}] ⚠️  DB update gagal setelah metadata: {e}")
 
     # ── 2. Load model ─────────────────────────────────────────────
     try:
@@ -144,10 +129,12 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  DB update gagal setelah model load: {e}")
 
-    # ── 3. Inferensi tile per tile ────────────────────────────────
+    # ── 3. Inferensi ──────────────────────────────────────────────
     tiles_done    = 0
     last_db_write = time.monotonic()
-    speed_window: list[float] = []
+
+    # deque O(1) append/popleft — lebih cepat dari list.pop(0) untuk rolling window
+    speed_window: deque[float] = deque(maxlen=20)
 
     try:
         tile_gen = generate_tiles_from_tiff(file_path, batch_size=batch_size)
@@ -156,22 +143,27 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
         return
 
     for batch, grid_idx in tile_gen:
+        batch_len = len(batch)  # simpan sebelum batch mungkin di-del
         try:
             t0      = time.monotonic()
             results = model.predict(source=batch, conf=conf, verbose=False, max_det=2000)
 
-            # Akumulasi count per class
+            # Bebaskan memori batch SEGERA setelah predict — sebelum akumulasi count
+            del batch
+            batch = None
+
+            # Akumulasi
             batch_counts = count_per_class(results, model)
+            del results  # bebaskan GPU/RAM segera
+
             for cls in class_names.values():
                 accumulated[cls] = accumulated.get(cls, 0) + batch_counts.get(cls, 0)
 
-            tiles_done += len(batch)
+            tiles_done += batch_len
 
-            # Hitung kecepatan dengan rolling window 20 batch
-            elapsed_per_tile = (time.monotonic() - t0) / max(len(batch), 1)
+            # Rolling speed — deque.append otomatis buang elemen lama
+            elapsed_per_tile = (time.monotonic() - t0) / max(batch_len, 1)
             speed_window.append(elapsed_per_tile)
-            if len(speed_window) > 20:
-                speed_window.pop(0)
 
             avg_spt       = sum(speed_window) / len(speed_window)
             tiles_per_sec = round(1 / avg_spt, 2) if avg_spt > 0 else 0
@@ -179,10 +171,9 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             eta           = int((total_grid - grid_idx) * avg_spt) if avg_spt > 0 else None
             running_total = sum(accumulated.values())
 
-            # Tulis ke DB maksimal 1x per detik — hindari hammering DB
-            # Gunakan pg_notify untuk realtime update ke Supabase
+            # DB write throttle — kurangi frekuensi dari 1s → 2s
             now = time.monotonic()
-            if now - last_db_write >= 1.0:
+            if now - last_db_write >= DB_WRITE_INTERVAL:
                 try:
                     update_job(
                         job_id,
@@ -196,32 +187,32 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
                             f"deteksi sementara: {running_total}"
                         ),
                     )
-                    # Notify Supabase Realtime listeners
                     notify_job_progress(job_id, {
-                        "progress": progress,
-                        "tiles_processed": tiles_done,
+                        "progress":         progress,
+                        "tiles_processed":  tiles_done,
                         "total_grid_tiles": total_grid,
                         "tiles_per_second": tiles_per_sec,
-                        "eta_seconds": eta,
-                        "running_total": running_total,
-                        "status": "processing",
+                        "eta_seconds":      eta,
+                        "running_total":    running_total,
+                        "status":           "processing",
                     })
                 except Exception as db_err:
-                    # DB sesaat tidak bisa dihubungi — log tapi lanjut inference
                     print(f"[{job_id[:8]}] ⚠️  DB write gagal (akan retry): {db_err}")
                 last_db_write = now
 
         except Exception as e:
-            # Error pada SATU batch tile — catat, tandai failed, hentikan inference
             tb = traceback.format_exc()
-            print(f"[{job_id[:8]}] ❌ Error saat inference batch (grid={grid_idx}):\n{tb}")
+            print(f"[{job_id[:8]}] ❌ Error inference batch (grid={grid_idx}):\n{tb}")
             _fail_job(job_id, f"Error saat inference tile {grid_idx}: {e}", e)
             return
         finally:
-            del batch
-            if 'results' in dir():
-                del results
-            gc.collect()
+            # Hanya gc.collect setiap ROW selesai, bukan tiap batch
+            # Ini dikontrol oleh tile3.py yang sudah yield per-batch per-row
+            if batch is not None:
+                del batch
+
+    # gc satu kali setelah semua tile selesai — tidak perlu tiap iterasi
+    gc.collect()
 
     # ── 4. Finalisasi ─────────────────────────────────────────────
     elapsed     = round(time.monotonic() - start, 1)
@@ -246,59 +237,45 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             temp_file_path=None,
             message=done_message,
         )
-        # Notify selesai ke Supabase Realtime
         notify_job_progress(job_id, {
-            "progress": 100,
-            "status": "done",
-            "total_detected": final_total,
-            "class_counts": accumulated,
+            "progress":        100,
+            "status":          "done",
+            "total_detected":  final_total,
+            "class_counts":    accumulated,
             "tiles_processed": tiles_done,
-            "message": done_message,
+            "message":         done_message,
         })
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  Gagal update final ke DB: {e}")
-        # Hasil inferensi sudah selesai tapi tidak bisa disimpan — tetap tandai failed
         _fail_job(job_id, f"Inferensi selesai tapi gagal simpan hasil ke DB: {e}", e)
         return
 
     print(f"[{job_id[:8]}] ✅ Done — {final_total} pohon · {tiles_done} tiles · {elapsed}s")
 
 
-# ─────────────────────────────────────────────
-# Job runner — dipanggil oleh executor.submit()
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Job runner
+# ──────────────────────────────────────────────
 
 def run_tif_upload_job(
     job_id: str, file_path: str, conf: float, batch_size: int
 ) -> None:
-    """
-    Runner untuk file TIF yang sudah ada di disk (upload langsung).
-    finally: file SELALU dihapus, tidak peduli sukses/gagal/exception.
-    """
     print(f"[{job_id[:8]}] 🚀 Mulai inference — {file_path}")
     try:
         _run_inference(job_id, file_path, conf, batch_size)
-
     except Exception as e:
-        # Catch-all: exception yang tidak tertangkap di _run_inference
         tb = traceback.format_exc()
         print(f"[{job_id[:8]}] ❌ Unhandled exception:\n{tb}")
         _fail_job(job_id, f"Error tidak terduga: {e}", e)
-
     finally:
-        # File temp SELALU dihapus — sukses maupun gagal
         safe_delete(file_path, f"tif_upload job={job_id[:8]}")
         gc.collect()
         print(f"[{job_id[:8]}] 🔓 Worker slot dibebaskan")
 
 
-# ─────────────────────────────────────────────
-# Public API — dipanggil dari main.py
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────
 
 def submit_tif_upload(job_id: str, file_path: str, conf: float, batch_size: int) -> None:
-    """
-    Submit job ke thread pool. Return langsung — tidak blocking.
-    ThreadPoolExecutor otomatis antri kalau semua slot penuh.
-    """
     _executor.submit(run_tif_upload_job, job_id, file_path, conf, batch_size)

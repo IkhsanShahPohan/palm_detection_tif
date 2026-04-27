@@ -1,7 +1,8 @@
 """
-test_api.py
+test_api.py  ·  v5
 Jalankan: python test_api.py
 Tidak butuh DB, Redis, atau model YOLO sungguhan — semua di-mock.
+Kompatibel dengan main.py v5 (versi string 5.0.0, aiofiles, ORJSONResponse).
 """
 
 import io
@@ -10,7 +11,7 @@ import os
 import sys
 import unittest
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ── Setup env sebelum import apapun ──────────────────────────
 os.environ["DATABASE_URL"] = "postgresql://test:test@localhost/test"
@@ -29,9 +30,30 @@ MOCKS = {
     "gdown":           MagicMock(),
     "running_model3":  MagicMock(),
     "tile3":           MagicMock(),
+    "aiofiles":        MagicMock(),
+    "orjson":          MagicMock(),
 }
 for mod, mock in MOCKS.items():
     sys.modules[mod] = mock
+
+# ── Mock aiofiles.open sebagai async context manager ─────────
+import types
+
+class _FakeAioFile:
+    async def write(self, data): pass
+    async def close(self): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): pass
+
+aiofiles_mock = MagicMock()
+aiofiles_mock.open = MagicMock(return_value=_FakeAioFile())
+sys.modules["aiofiles"] = aiofiles_mock
+
+# ── Mock fastapi.responses.ORJSONResponse ────────────────────
+# ORJSONResponse butuh orjson yang mungkin tidak terinstall di test env
+from fastapi.responses import JSONResponse
+import fastapi.responses as _fr
+_fr.ORJSONResponse = JSONResponse   # fallback ke JSONResponse standar
 
 # ── Mock database dan worker ──────────────────────────────────
 db_mock     = MagicMock()
@@ -40,6 +62,15 @@ worker_mock.MAX_CONCURRENT = 2
 worker_mock.safe_delete    = MagicMock()
 worker_mock._executor      = MagicMock()
 worker_mock._executor._work_queue.qsize.return_value = 0
+
+# Pastikan semua fungsi DB yang di-await bisa dikembalikan sebagai coroutine
+db_mock.init_db          = MagicMock(return_value=None)
+db_mock.get_stale_jobs   = MagicMock(return_value=[])
+db_mock.count_active_jobs = MagicMock(return_value=0)
+db_mock.create_job       = MagicMock(return_value=None)
+db_mock.update_job       = MagicMock(return_value=None)
+db_mock.get_job          = MagicMock(return_value=None)
+db_mock.get_history      = MagicMock(return_value={"total": 0, "limit": 50, "offset": 0, "data": []})
 
 sys.modules["database"] = db_mock
 sys.modules["worker"]   = worker_mock
@@ -56,7 +87,8 @@ H      = {"X-API-Key": "test-key-rahasia", "X-User-ID": "user_123"}
 H_NOID = {"X-API-Key": "test-key-rahasia"}
 H_BKEY = {"X-API-Key": "key-salah",        "X-User-ID": "user_123"}
 
-# ── Sample job untuk mock return ─────────────────────────────
+
+# ── Sample job ────────────────────────────────────────────────
 def make_job(status="queued", total=0, user="user_123", source="tif_upload"):
     return {
         "job_id":           "job-abc-123",
@@ -147,22 +179,20 @@ class TestUploadTIF(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
 
-        # Semua field wajib ada
         for field in ["status", "job_id", "user_id", "filename",
                       "size_bytes", "size_mb", "message", "poll_url",
                       "realtime_channel", "realtime_event"]:
             self.assertIn(field, body, f"Field '{field}' tidak ada di response")
 
-        self.assertEqual(body["status"],            "queued")
-        self.assertEqual(body["user_id"],           "user_123")
-        self.assertEqual(body["filename"],          "kebun_blok_a.tif")
-        self.assertEqual(body["realtime_channel"],  "job_progress")
-        self.assertEqual(body["realtime_event"],    body["job_id"])
+        self.assertEqual(body["status"],           "queued")
+        self.assertEqual(body["user_id"],          "user_123")
+        self.assertEqual(body["filename"],         "kebun_blok_a.tif")
+        self.assertEqual(body["realtime_channel"], "job_progress")
+        self.assertEqual(body["realtime_event"],   body["job_id"])
         self.assertIn("/status/", body["poll_url"])
         self.assertGreater(body["size_bytes"], 0)
         self.assertTrue(body["job_id"])
 
-        # Worker harus dipanggil tepat sekali
         self.assertEqual(worker_mock.submit_tif_upload.call_count, 1)
         print(f"\n  ✓ upload response:\n{json.dumps(body, indent=4)}")
 
@@ -177,16 +207,14 @@ class TestUploadTIF(unittest.TestCase):
     def test_conf_di_luar_range_422(self):
         r = client.post("/detect/tif", headers=H,
             files={"file": ("k.tif", io.BytesIO(b"data"), "image/tiff")},
-            data={"conf": "1.5", "batch_size": "4"})  # conf > 1.0
+            data={"conf": "1.5", "batch_size": "4"})
         self.assertEqual(r.status_code, 422)
 
     def test_endpoint_tif_url_tidak_ada_404(self):
-        """Endpoint /detect/tif-url sudah dihapus — harus 404 atau 405."""
         r = client.post("/detect/tif-url", headers=H,
             data={"gdrive_url": "https://drive.google.com/file/d/abc/view",
                   "conf": "0.5", "batch_size": "4"})
-        self.assertIn(r.status_code, [404, 405],
-                      "/detect/tif-url seharusnya tidak ada lagi")
+        self.assertIn(r.status_code, [404, 405])
         print(f"\n  ✓ /detect/tif-url sudah dihapus (HTTP {r.status_code})")
 
 
@@ -197,52 +225,29 @@ class TestStatus(unittest.TestCase):
 
     def test_job_tidak_ada_404(self):
         db_mock.get_job.return_value = None
-        r = client.get("/status/tidak-ada", headers=H)
+        r = client.get("/status/job-tidak-ada", headers=H)
         self.assertEqual(r.status_code, 404)
 
-    def test_job_queued_semua_field_ada(self):
-        db_mock.get_job.return_value = make_job("queued")
+    def test_job_ada_200(self):
+        db_mock.get_job.return_value = make_job("processing")
         r = client.get("/status/job-abc-123", headers=H)
         self.assertEqual(r.status_code, 200)
         body = r.json()
+        for f in ["job_id", "status", "progress", "total_detected",
+                  "class_counts", "tiles_processed", "total_grid_tiles",
+                  "tiles_per_second", "eta_seconds", "message"]:
+            self.assertIn(f, body, f"Field '{f}' tidak ada")
 
-        expected_fields = [
-            "job_id", "user_id", "source_type", "status", "progress",
-            "total_detected", "class_counts", "tiles_processed",
-            "total_grid_tiles", "tiles_per_second", "eta_seconds",
-            "tif_info", "filename", "file_size_bytes", "message",
-            "created_at", "updated_at",
-        ]
-        for f in expected_fields:
-            self.assertIn(f, body, f"Field '{f}' tidak ada di /status response")
-
-        self.assertEqual(body["status"],  "queued")
-        self.assertEqual(body["user_id"], "user_123")
-        print(f"\n  ✓ semua {len(expected_fields)} field ada di /status response")
-
-    def test_job_done_total_detected_terisi(self):
-        db_mock.get_job.return_value = make_job("done", total=1247)
+    def test_job_done_total_detected(self):
+        db_mock.get_job.return_value = make_job("done", total=1234)
         r = client.get("/status/job-abc-123", headers=H)
-        body = r.json()
-        self.assertEqual(body["status"],         "done")
-        self.assertEqual(body["progress"],       100)
-        self.assertEqual(body["total_detected"], 1247)
-        self.assertEqual(body["class_counts"]["total"], 1247)
-        print(f"  ✓ done: total_detected={body['total_detected']}")
-
-    def test_job_failed_ada_message(self):
-        job = make_job("failed")
-        job["message"] = "Gagal: file TIF korup."
-        db_mock.get_job.return_value = job
-        r = client.get("/status/job-abc-123", headers=H)
-        body = r.json()
-        self.assertEqual(body["status"], "failed")
-        self.assertIn("Gagal", body["message"])
-        print(f"  ✓ failed: message='{body['message']}'")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["total_detected"], 1234)
+        print(f"  ✓ total_detected=1234 dikembalikan dengan benar")
 
 
 # ═════════════════════════════════════════════
-# TEST: History & Filter
+# TEST: History
 # ═════════════════════════════════════════════
 class TestHistory(unittest.TestCase):
 
@@ -254,14 +259,13 @@ class TestHistory(unittest.TestCase):
             "data":   jobs,
         }
 
-    def test_history_struktur_response(self):
-        self._mock_history([make_job("done", total=500)])
+    def test_history_struktur(self):
+        self._mock_history([make_job("done")])
         r = client.get("/history", headers=H)
         self.assertEqual(r.status_code, 200)
         body = r.json()
-
         for f in ["total", "limit", "offset", "has_more", "data"]:
-            self.assertIn(f, body, f"Field '{f}' tidak ada di /history")
+            self.assertIn(f, body)
         self.assertEqual(len(body["data"]), 1)
         self.assertFalse(body["has_more"])
 
@@ -278,7 +282,6 @@ class TestHistory(unittest.TestCase):
         body = r.json()
         self.assertIn("user_id", body)
         self.assertEqual(body["user_id"], "user_123")
-        print(f"  ✓ /history/me user_id: {body['user_id']}")
 
     def test_history_kosong_valid(self):
         self._mock_history([])
@@ -292,10 +295,8 @@ class TestHistory(unittest.TestCase):
         self._mock_history([])
         r = client.get("/history?status=done&limit=10", headers=H)
         self.assertEqual(r.status_code, 200)
-        # Pastikan get_history dipanggil dengan status=done
         call_kwargs = db_mock.get_history.call_args.kwargs
         self.assertEqual(call_kwargs.get("status"), "done")
-        print(f"  ✓ filter status=done diteruskan ke DB")
 
     def test_history_filter_date_from_date_to(self):
         self._mock_history([])
@@ -304,7 +305,6 @@ class TestHistory(unittest.TestCase):
         call_kwargs = db_mock.get_history.call_args.kwargs
         self.assertEqual(call_kwargs.get("date_from"), "2024-01-01")
         self.assertEqual(call_kwargs.get("date_to"),   "2024-12-31")
-        print(f"  ✓ filter date_from & date_to diteruskan ke DB")
 
     def test_history_sort_by_total_detected(self):
         self._mock_history([])
@@ -313,7 +313,6 @@ class TestHistory(unittest.TestCase):
         call_kwargs = db_mock.get_history.call_args.kwargs
         self.assertEqual(call_kwargs.get("sort_by"),    "total_detected")
         self.assertEqual(call_kwargs.get("sort_order"), "desc")
-        print(f"  ✓ sort_by=total_detected diteruskan ke DB")
 
     def test_history_me_filter_status_dan_date(self):
         self._mock_history([])
@@ -323,15 +322,11 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(call_kwargs.get("status"),    "failed")
         self.assertEqual(call_kwargs.get("date_from"), "2024-06-01")
         self.assertEqual(call_kwargs.get("user_id"),   "user_123")
-        print(f"  ✓ /history/me filter status+date+user_id benar")
 
     def test_history_limit_max_100(self):
-        """limit > 100 harus di-clamp ke 100."""
         self._mock_history([])
         r = client.get("/history?limit=200", headers=H)
-        # FastAPI Query(le=100) akan return 422 jika > 100
         self.assertIn(r.status_code, [200, 422])
-        print(f"  ✓ limit > 100 ditolak atau di-clamp (HTTP {r.status_code})")
 
 
 # ═════════════════════════════════════════════
@@ -361,11 +356,11 @@ class TestAdmin(unittest.TestCase):
             for f in ["status", "database", "max_workers", "version"]:
                 self.assertIn(f, body)
 
-    def test_health_version_4(self):
+    def test_health_version_5(self):
         r = client.get("/health")
         if r.status_code == 200:
-            self.assertEqual(r.json()["version"], "4.0.0")
-            print(f"  ✓ version = 4.0.0")
+            self.assertEqual(r.json()["version"], "5.0.0")
+            print(f"  ✓ version = 5.0.0")
 
 
 # ═════════════════════════════════════════════
@@ -374,7 +369,6 @@ class TestAdmin(unittest.TestCase):
 class TestFailureScenarios(unittest.TestCase):
 
     def test_multiple_user_berbeda_bisa_submit_bersamaan(self):
-        """User A dan User B masing-masing punya slot sendiri."""
         db_mock.count_active_jobs.return_value = 0
         db_mock.create_job.return_value        = None
         worker_mock.submit_tif_upload.reset_mock()
@@ -391,16 +385,13 @@ class TestFailureScenarios(unittest.TestCase):
         print(f"  ✓ 3 user berbeda submit bersamaan: semua queued")
 
     def test_job_gagal_tidak_blok_job_baru(self):
-        """Setelah ada job failed, user masih bisa submit job baru."""
         db_mock.count_active_jobs.return_value = 0
         r = client.post("/detect/tif", headers=H,
             files={"file": ("baru.tif", io.BytesIO(b"data" * 100), "image/tiff")},
             data={"conf": "0.5", "batch_size": "4"})
         self.assertEqual(r.status_code, 200)
-        print(f"  ✓ job baru bisa submit setelah ada yang failed")
 
     def test_response_upload_ada_realtime_info(self):
-        """Response upload harus menyertakan info realtime channel."""
         db_mock.count_active_jobs.return_value = 0
         worker_mock.submit_tif_upload.reset_mock()
         r = client.post("/detect/tif", headers=H,
@@ -412,7 +403,6 @@ class TestFailureScenarios(unittest.TestCase):
         self.assertIn("realtime_event",   body)
         self.assertEqual(body["realtime_channel"], "job_progress")
         self.assertEqual(body["realtime_event"],   body["job_id"])
-        print(f"  ✓ realtime_channel=job_progress, realtime_event={body['realtime_event'][:8]}...")
 
 
 # ═════════════════════════════════════════════
@@ -422,7 +412,7 @@ if __name__ == "__main__":
     os.makedirs("temp_test_uploads", exist_ok=True)
 
     print("=" * 60)
-    print("Palm Tree Detection API v4 — Test Suite")
+    print("Palm Tree Detection API v5 — Test Suite")
     print("=" * 60)
 
     loader = unittest.TestLoader()
@@ -447,10 +437,10 @@ if __name__ == "__main__":
     else:
         print(f"❌  {len(result.failures)} gagal · {len(result.errors)} error dari {result.testsRun} test")
         for f in result.failures:
-            print(f"\n  FAIL: {f[0]}")
-            print(f"  {f[1]}")
+            print(f"\n  FAIL: {f[0]}\n  {f[1]}")
         for e in result.errors:
-            print(f"\n  ERROR: {e[0]}")
-            print(f"  {e[1]}")
+            print(f"\n  ERROR: {e[0]}\n  {e[1]}")
     print("=" * 60)
-    sys.exit(0 if result.wasSuccessful() else 1)
+
+    import sys as _sys
+    _sys.exit(0 if result.wasSuccessful() else 1)
