@@ -233,17 +233,23 @@ class TestStatus(unittest.TestCase):
         r = client.get("/status/job-abc-123", headers=H)
         self.assertEqual(r.status_code, 200)
         body = r.json()
-        for f in ["job_id", "status", "progress", "total_detected",
+        for f in ["job_id", "status", "progress",
                   "class_counts", "tiles_processed", "total_grid_tiles",
-                  "tiles_per_second", "eta_seconds", "message"]:
+                  "eta_seconds", "elapsed_seconds", "filename"]:
             self.assertIn(f, body, f"Field '{f}' tidak ada")
 
-    def test_job_done_total_detected(self):
+    def test_job_done_class_counts_total(self):
         db_mock.get_job.return_value = make_job("done", total=1234)
         r = client.get("/status/job-abc-123", headers=H)
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["total_detected"], 1234)
-        print(f"  ✓ total_detected=1234 dikembalikan dengan benar")
+        body = r.json()
+        self.assertEqual(body["class_counts"]["total"], 1234)
+        self.assertNotIn("total_detected", body)
+        self.assertNotIn("message", body)
+        self.assertNotIn("tiles_per_second", body)
+        self.assertNotIn("file_size_bytes", body)
+        self.assertIn("elapsed_seconds", body)
+        print(f"  ✓ class_counts.total=1234, field-field lama sudah tidak ada")
 
 
 # ═════════════════════════════════════════════

@@ -30,7 +30,6 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
             raise RuntimeError(
                 "DATABASE_URL belum diset. Salin .env.example ke .env lalu isi nilai DATABASE_URL."
             )
-        # min=2 koneksi siap pakai, max=10 untuk spike traffic
         _pool = psycopg2.pool.ThreadedConnectionPool(2, 10, DATABASE_URL)
     return _pool
 
@@ -68,16 +67,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     class_counts      JSONB       NOT NULL DEFAULT '{}',
     total_grid_tiles  INTEGER     NOT NULL DEFAULT 0,
     tiles_processed   INTEGER     NOT NULL DEFAULT 0,
-    tiles_per_second  REAL        NOT NULL DEFAULT 0,
     eta_seconds       INTEGER,
+    elapsed_seconds   INTEGER,
     tif_info          JSONB       NOT NULL DEFAULT '{}',
     filename          TEXT,
     file_size_bytes   BIGINT,
-    message           TEXT,
     temp_file_path    TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Migrasi: tambah kolom baru jika tabel sudah ada dari versi sebelumnya
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS elapsed_seconds INTEGER;
+ALTER TABLE jobs DROP COLUMN IF EXISTS tiles_per_second;
+ALTER TABLE jobs DROP COLUMN IF EXISTS message;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_user_id    ON jobs (user_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs (status);
@@ -110,22 +113,19 @@ def create_job(
                 """
                 INSERT INTO jobs
                     (job_id, user_id, source_type, filename,
-                     file_size_bytes, temp_file_path, message)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                     file_size_bytes, temp_file_path)
+                VALUES (%s,%s,%s,%s,%s,%s)
                 """,
-                (
-                    job_id, user_id, source_type, filename,
-                    file_size_bytes, temp_file_path,
-                    "Job sedang antri...",
-                ),
+                (job_id, user_id, source_type, filename,
+                 file_size_bytes, temp_file_path),
             )
 
 
 _UPDATABLE = {
-    "status", "progress", "message",
+    "status", "progress",
     "total_detected", "class_counts",
     "total_grid_tiles", "tiles_processed",
-    "tiles_per_second", "eta_seconds",
+    "eta_seconds", "elapsed_seconds",
     "tif_info", "temp_file_path",
 }
 
@@ -167,10 +167,10 @@ def get_history(
     user_id: str | None = None,
     status: str | None = None,
     source_type: str | None = None,
-    date_from: str | None = None,      # ISO date string, e.g. "2024-01-01"
-    date_to: str | None = None,        # ISO date string, e.g. "2024-12-31"
-    sort_by: str = "created_at",       # created_at | updated_at | total_detected
-    sort_order: str = "desc",          # asc | desc
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -185,10 +185,8 @@ def get_history(
     if date_from:
         conds.append("created_at >= %s"); params.append(date_from)
     if date_to:
-        # Inklusif sampai akhir hari
         conds.append("created_at <= (%s::date + INTERVAL '1 day')"); params.append(date_to)
 
-    # Whitelist sort column untuk cegah SQL injection
     allowed_sort = {"created_at", "updated_at", "total_detected", "progress"}
     order_col    = sort_by if sort_by in allowed_sort else "created_at"
     order_dir    = "ASC" if sort_order.lower() == "asc" else "DESC"
@@ -237,26 +235,11 @@ def get_stale_jobs() -> list[dict]:
 # ─────────────────────────────────────────────
 
 def notify_job_progress(job_id: str, payload: dict) -> None:
-    """
-    Kirim pg_notify pada channel 'job_progress' dengan payload JSON.
-    Supabase Realtime (Postgres Changes) akan meneruskan ke klien
-    yang subscribe ke channel ini.
-
-    Tidak raise exception — jika gagal, hanya dicatat ke log.
-    Worker tidak boleh crash hanya karena notify gagal.
-
-    Cara subscribe dari Flutter/JS (contoh):
-        supabase
-          .channel('job_progress')
-          .on('broadcast', { event: job_id }, handler)
-          .subscribe()
-    """
     try:
         payload["job_id"] = job_id
         payload_str = json.dumps(payload)
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # pg_notify(channel, payload)
                 cur.execute(
                     "SELECT pg_notify('job_progress', %s)",
                     (payload_str,),

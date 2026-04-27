@@ -65,7 +65,6 @@ def _fail_job(job_id: str, message: str, exc: Exception | None = None) -> None:
             job_id,
             status="failed",
             temp_file_path=None,
-            message=detail,
         )
     except Exception as inner:
         print(f"[{job_id[:8]}] ⚠️  Tidak bisa update status ke DB: {inner}")
@@ -87,8 +86,7 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
 
     # ── 1. Metadata ───────────────────────────────────────────────
     try:
-        update_job(job_id, status="processing", progress=2,
-                   message="Membaca metadata TIF...")
+        update_job(job_id, status="processing", progress=2)
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  DB update gagal di step 1: {e}")
 
@@ -105,11 +103,6 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             progress=4,
             total_grid_tiles=total_grid,
             tif_info=tif_info,
-            message=(
-                f"TIF {tif_info['width']}×{tif_info['height']}px "
-                f"({tif_info['file_size_mb']} MB) · "
-                f"~{total_grid} grid tiles · Memuat model..."
-            ),
         )
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  DB update gagal setelah metadata: {e}")
@@ -124,8 +117,7 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
         return
 
     try:
-        update_job(job_id, progress=5,
-                   message=f"Model siap. Mulai inferensi ~{total_grid} tiles...")
+        update_job(job_id, progress=5)
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  DB update gagal setelah model load: {e}")
 
@@ -179,19 +171,12 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
                         job_id,
                         progress=progress,
                         tiles_processed=tiles_done,
-                        tiles_per_second=tiles_per_sec,
                         eta_seconds=eta,
-                        message=(
-                            f"Tile {tiles_done} selesai (grid {grid_idx}/{total_grid}) · "
-                            f"{tiles_per_sec} tile/s · ETA {_fmt_duration(eta)} · "
-                            f"deteksi sementara: {running_total}"
-                        ),
                     )
                     notify_job_progress(job_id, {
                         "progress":         progress,
                         "tiles_processed":  tiles_done,
                         "total_grid_tiles": total_grid,
-                        "tiles_per_second": tiles_per_sec,
                         "eta_seconds":      eta,
                         "running_total":    running_total,
                         "status":           "processing",
@@ -219,11 +204,6 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
     final_total = sum(accumulated.values())
     accumulated["total"] = final_total
 
-    done_message = (
-        f"Selesai dalam {_fmt_duration(int(elapsed))}. "
-        f"Terdeteksi {final_total} pohon sawit dari {tiles_done} tile valid."
-    )
-
     try:
         update_job(
             job_id,
@@ -232,18 +212,16 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             total_detected=final_total,
             class_counts=accumulated,
             tiles_processed=tiles_done,
-            tiles_per_second=0,
             eta_seconds=0,
+            elapsed_seconds=int(elapsed),
             temp_file_path=None,
-            message=done_message,
         )
         notify_job_progress(job_id, {
             "progress":        100,
             "status":          "done",
-            "total_detected":  final_total,
             "class_counts":    accumulated,
             "tiles_processed": tiles_done,
-            "message":         done_message,
+            "elapsed_seconds": int(elapsed),
         })
     except Exception as e:
         print(f"[{job_id[:8]}] ⚠️  Gagal update final ke DB: {e}")
