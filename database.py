@@ -1,12 +1,8 @@
 """
 database.py
 Koneksi PostgreSQL Supabase via psycopg2 ThreadedConnectionPool.
-Pool memastikan banyak thread (worker inference + FastAPI request handler)
-bisa baca/tulis DB bersamaan tanpa konflik.
 
-Fitur tambahan:
-- notify_job_progress: kirim pg_notify untuk Supabase Realtime
-- get_history: filter date_from, date_to, sort_by
+Kolom primary key: `id` (sebelumnya job_id)
 """
 
 import json
@@ -36,10 +32,6 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
 
 @contextmanager
 def get_conn():
-    """
-    Context manager — ambil koneksi dari pool, commit/rollback otomatis,
-    kembalikan ke pool setelah selesai. Thread-safe.
-    """
     pool = _get_pool()
     conn = pool.getconn()
     try:
@@ -53,17 +45,15 @@ def get_conn():
 
 
 # ─────────────────────────────────────────────
-# DDL — tabel dibuat otomatis saat startup
+# DDL
 # ─────────────────────────────────────────────
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_id            TEXT PRIMARY KEY,
+    id                TEXT PRIMARY KEY,
     user_id           TEXT        NOT NULL DEFAULT 'anonymous',
-    source_type       TEXT        NOT NULL DEFAULT 'tif_upload',
     status            TEXT        NOT NULL DEFAULT 'queued',
     progress          INTEGER     NOT NULL DEFAULT 0,
-    total_detected    INTEGER     NOT NULL DEFAULT 0,
     class_counts      JSONB       NOT NULL DEFAULT '{}',
     total_grid_tiles  INTEGER     NOT NULL DEFAULT 0,
     tiles_processed   INTEGER     NOT NULL DEFAULT 0,
@@ -77,18 +67,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Migrasi: tambah kolom baru jika tabel sudah ada dari versi sebelumnya
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS elapsed_seconds INTEGER;
-ALTER TABLE jobs DROP COLUMN IF EXISTS tiles_per_second;
-ALTER TABLE jobs DROP COLUMN IF EXISTS message;
-
 CREATE INDEX IF NOT EXISTS idx_jobs_user_id    ON jobs (user_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs (status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at DESC);
 """
 
+
 def init_db():
-    """Panggil sekali saat startup — buat tabel + index jika belum ada."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_DDL)
@@ -102,7 +87,6 @@ def init_db():
 def create_job(
     job_id: str,
     user_id: str,
-    source_type: str,
     filename: str | None = None,
     file_size_bytes: int | None = None,
     temp_file_path: str | None = None,
@@ -111,19 +95,16 @@ def create_job(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO jobs
-                    (job_id, user_id, source_type, filename,
-                     file_size_bytes, temp_file_path)
-                VALUES (%s,%s,%s,%s,%s,%s)
+                INSERT INTO jobs (id, user_id, filename, file_size_bytes, temp_file_path)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
-                (job_id, user_id, source_type, filename,
-                 file_size_bytes, temp_file_path),
+                (job_id, user_id, filename, file_size_bytes, temp_file_path),
             )
 
 
 _UPDATABLE = {
     "status", "progress",
-    "total_detected", "class_counts",
+    "class_counts",
     "total_grid_tiles", "tiles_processed",
     "eta_seconds", "elapsed_seconds",
     "tif_info", "temp_file_path",
@@ -131,7 +112,6 @@ _UPDATABLE = {
 
 
 def update_job(job_id: str, **kwargs) -> None:
-    """Update satu atau banyak kolom sekaligus. Aman dipanggil dari thread manapun."""
     cols, vals = [], []
     for k, v in kwargs.items():
         if k not in _UPDATABLE:
@@ -150,7 +130,7 @@ def update_job(job_id: str, **kwargs) -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE jobs SET {', '.join(cols)} WHERE job_id = %s",
+                f"UPDATE jobs SET {', '.join(cols)} WHERE id = %s",
                 tuple(vals),
             )
 
@@ -158,7 +138,7 @@ def update_job(job_id: str, **kwargs) -> None:
 def get_job(job_id: str) -> dict | None:
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM jobs WHERE job_id = %s", (job_id,))
+            cur.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
     return _normalize(dict(row)) if row else None
 
@@ -166,12 +146,11 @@ def get_job(job_id: str) -> dict | None:
 def get_history(
     user_id: str | None = None,
     status: str | None = None,
-    source_type: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     sort_by: str = "created_at",
     sort_order: str = "desc",
-    limit: int = 50,
+    limit: int = 20,
     offset: int = 0,
 ) -> dict:
     conds, params = ["1=1"], []
@@ -180,14 +159,12 @@ def get_history(
         conds.append("user_id = %s"); params.append(user_id)
     if status:
         conds.append("status = %s"); params.append(status)
-    if source_type:
-        conds.append("source_type = %s"); params.append(source_type)
     if date_from:
         conds.append("created_at >= %s"); params.append(date_from)
     if date_to:
         conds.append("created_at <= (%s::date + INTERVAL '1 day')"); params.append(date_to)
 
-    allowed_sort = {"created_at", "updated_at", "total_detected", "progress"}
+    allowed_sort = {"created_at", "updated_at", "progress"}
     order_col    = sort_by if sort_by in allowed_sort else "created_at"
     order_dir    = "ASC" if sort_order.lower() == "asc" else "DESC"
 
@@ -221,29 +198,25 @@ def count_active_jobs(user_id: str) -> int:
 
 
 def get_stale_jobs() -> list[dict]:
-    """Ambil job masih queued/processing — untuk cleanup saat server restart."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                "SELECT job_id, temp_file_path FROM jobs WHERE status IN ('queued','processing')"
+                "SELECT id, temp_file_path FROM jobs WHERE status IN ('queued','processing')"
             )
             return [dict(r) for r in cur.fetchall()]
 
 
 # ─────────────────────────────────────────────
-# Supabase Realtime — pg_notify
+# Supabase Realtime
 # ─────────────────────────────────────────────
 
 def notify_job_progress(job_id: str, payload: dict) -> None:
     try:
-        payload["job_id"] = job_id
+        payload["id"] = job_id
         payload_str = json.dumps(payload)
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT pg_notify('job_progress', %s)",
-                    (payload_str,),
-                )
+                cur.execute("SELECT pg_notify('job_progress', %s)", (payload_str,))
     except Exception as e:
         print(f"[notify] ⚠️  pg_notify gagal untuk job {job_id[:8]}: {e}")
 

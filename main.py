@@ -62,7 +62,7 @@ async def _db(fn, *args, **kwargs):
 async def _mark_stale_jobs_failed():
     stale = await _db(db.get_stale_jobs)
     for row in stale:
-        job_id    = row["job_id"]
+        job_id    = row["id"]
         temp_path = row.get("temp_file_path")
         print(f"[startup] ♻️  Stale job: {job_id[:8]} → failed")
         worker.safe_delete(temp_path, "stale")
@@ -142,9 +142,8 @@ def get_user_id(
 
 def _job_to_response(job: dict) -> dict:
     return {
-        "job_id":           job["job_id"],
+        "id":               job["id"],
         "user_id":          job["user_id"],
-        "source_type":      job["source_type"],
         "status":           job["status"],
         "progress":         job["progress"],
         "class_counts":     job["class_counts"],
@@ -180,9 +179,7 @@ async def detect_tif_upload(
     """
     Upload file TIF/TIFF — proses berjalan di **background** (non-blocking).
 
-    Response langsung mengembalikan `job_id`.
-    Gunakan `GET /status/{job_id}` untuk polling progress,
-    atau subscribe ke Supabase Realtime channel `job_progress` untuk update real-time.
+    Response langsung mengembalikan `id` job yang bisa dipakai untuk polling via `GET /jobs/{id}`.
 
     **Batas ukuran:** 500 MB default (ubah via env `MAX_TIF_BYTES`).
     """
@@ -218,7 +215,6 @@ async def detect_tif_upload(
         db.create_job,
         job_id=job_id,
         user_id=user_id,
-        source_type="tif_upload",
         filename=file.filename,
         file_size_bytes=file.size,
         temp_file_path=temp_path,
@@ -239,7 +235,6 @@ async def detect_tif_upload(
                         db.update_job, job_id,
                         status="failed",
                         temp_file_path=None,
-                        message="File melebihi batas ukuran saat upload.",
                     )
                     raise HTTPException(
                         413,
@@ -256,7 +251,6 @@ async def detect_tif_upload(
             db.update_job, job_id,
             status="failed",
             temp_file_path=None,
-            message=f"Gagal menyimpan file: {exc}",
         )
         raise HTTPException(500, f"Gagal menyimpan file upload: {exc}")
 
@@ -267,7 +261,6 @@ async def detect_tif_upload(
             db.update_job, job_id,
             status="failed",
             temp_file_path=None,
-            message="File kosong.",
         )
         raise HTTPException(400, "File tidak boleh kosong.")
 
@@ -276,16 +269,11 @@ async def detect_tif_upload(
     worker.submit_tif_upload(job_id, temp_path, conf, batch_size)
 
     return {
-        "status":           "queued",
-        "job_id":           job_id,
-        "user_id":          user_id,
-        "filename":         file.filename,
-        "size_bytes":       bytes_written,
-        "size_mb":          round(bytes_written / 1024 / 1024, 2),
-        "message":          "Job diterima dan masuk antrian. Proses berjalan di background.",
-        "poll_url":         f"/status/{job_id}",
-        "realtime_channel": "job_progress",
-        "realtime_event":   job_id,
+        "id":         job_id,
+        "status":     "queued",
+        "user_id":    user_id,
+        "filename":   file.filename,
+        "size_bytes": bytes_written,
     }
 
 
@@ -294,87 +282,52 @@ async def detect_tif_upload(
 # ──────────────────────────────────────────────
 
 @app.get(
-    "/status/{job_id}",
-    tags=["Status & Riwayat"],
-    summary="Cek status dan progress job",
+    "/jobs/{job_id}",
+    tags=["Jobs"],
+    summary="Detail satu job berdasarkan id",
 )
-async def get_status(
+async def get_job(
     job_id: str,
-    _key: str = Depends(require_api_key),
+    _key: str    = Depends(require_api_key),
+    user_id: str = Depends(get_user_id),
 ):
     """
-    Polling status job. Panggil setiap 3–5 detik dari klien,
-    atau gunakan Supabase Realtime untuk update instan tanpa polling.
+    Ambil detail dan status terkini satu job.
+    Polling setiap 3–5 detik, atau gunakan Supabase Realtime
+    channel `job_progress` untuk update tanpa polling.
     """
     job = await _db(db.get_job, job_id)
     if not job:
         raise HTTPException(404, f"Job '{job_id}' tidak ditemukan.")
+    if job["user_id"] != user_id and user_id != "anonymous":
+        raise HTTPException(403, "Kamu tidak punya akses ke job ini.")
     return _job_to_response(job)
 
 
 # ──────────────────────────────────────────────
-# ENDPOINT: Riwayat semua job
+# ENDPOINT: List job milik user
 # ──────────────────────────────────────────────
 
 @app.get(
-    "/history",
-    tags=["Status & Riwayat"],
-    summary="Riwayat job dengan filter lengkap dan pagination",
+    "/jobs",
+    tags=["Jobs"],
+    summary="List semua job milik user yang sedang login",
 )
-async def history(
-    user_id:     Optional[str] = Query(default=None, description="Filter berdasarkan user_id"),
-    status:      Optional[str] = Query(default=None, description="queued | processing | done | failed"),
-    source_type: Optional[str] = Query(default=None, description="tif_upload"),
-    date_from:   Optional[str] = Query(default=None, description="YYYY-MM-DD, inklusif"),
-    date_to:     Optional[str] = Query(default=None, description="YYYY-MM-DD, inklusif"),
-    sort_by:     str           = Query(default="created_at", description="created_at | updated_at | total_detected | progress"),
-    sort_order:  str           = Query(default="desc", description="asc | desc"),
-    limit:       int           = Query(default=50, ge=1, le=100),
-    offset:      int           = Query(default=0, ge=0),
-    _key: str = Depends(require_api_key),
-):
-    result = await _db(
-        db.get_history,
-        user_id=user_id,
-        status=status,
-        source_type=source_type,
-        date_from=date_from,
-        date_to=date_to,
-        sort_by=sort_by,
-        sort_order=sort_order,
-        limit=limit,
-        offset=offset,
-    )
-    return {
-        "total":    result["total"],
-        "limit":    result["limit"],
-        "offset":   result["offset"],
-        "has_more": (result["offset"] + len(result["data"])) < result["total"],
-        "data":     [_job_to_response(j) for j in result["data"]],
-    }
-
-
-# ──────────────────────────────────────────────
-# ENDPOINT: Riwayat milik user sendiri
-# ──────────────────────────────────────────────
-
-@app.get(
-    "/history/me",
-    tags=["Status & Riwayat"],
-    summary="Riwayat job milik user yang sedang login",
-)
-async def history_me(
-    status:     Optional[str] = Query(default=None),
-    date_from:  Optional[str] = Query(default=None),
-    date_to:    Optional[str] = Query(default=None),
-    sort_by:    str           = Query(default="created_at"),
-    sort_order: str           = Query(default="desc"),
+async def list_jobs(
+    status:     Optional[str] = Query(default=None, description="queued | processing | done | failed"),
+    date_from:  Optional[str] = Query(default=None, description="YYYY-MM-DD, inklusif"),
+    date_to:    Optional[str] = Query(default=None, description="YYYY-MM-DD, inklusif"),
+    sort_by:    str           = Query(default="created_at", description="created_at | updated_at | progress"),
+    sort_order: str           = Query(default="desc",       description="asc | desc"),
     limit:      int           = Query(default=20, ge=1, le=100),
-    offset:     int           = Query(default=0, ge=0),
+    offset:     int           = Query(default=0,  ge=0),
     _key: str    = Depends(require_api_key),
     user_id: str = Depends(get_user_id),
 ):
-    """user_id diambil otomatis dari header X-User-ID."""
+    """
+    Mengembalikan semua job milik user berdasarkan header `X-User-ID`.
+    Mendukung filter status, rentang tanggal, sorting, dan pagination.
+    """
     result = await _db(
         db.get_history,
         user_id=user_id,

@@ -209,7 +209,6 @@ def _run_inference(job_id: str, file_path: str, conf: float, batch_size: int) ->
             job_id,
             status="done",
             progress=100,
-            total_detected=final_total,
             class_counts=accumulated,
             tiles_processed=tiles_done,
             eta_seconds=0,
