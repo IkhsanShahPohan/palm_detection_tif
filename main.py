@@ -169,7 +169,7 @@ def _job_to_response(job: dict) -> dict:
 )
 async def detect_tif_upload(
     file: UploadFile = File(..., description="File .tif / .tiff"),
-    conf: float      = Form(default=0.5, ge=0.1, le=1.0,
+    conf: float      = Form(default=0.6, ge=0.1, le=1.0,
                             description="Confidence threshold (0.1–1.0)"),
     batch_size: int  = Form(default=4, ge=1, le=16,
                             description="Tile per batch inferensi"),

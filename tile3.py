@@ -2,7 +2,6 @@ import gc
 import os
 
 import cv2
-import gdown
 import numpy as np
 import rasterio
 from rasterio.windows import Window

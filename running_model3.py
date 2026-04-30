@@ -38,7 +38,7 @@ def merge_class_counts(a: dict, b: dict) -> dict:
     return result
 
 
-def run_detection_stream(model_path: str, tile_generator, conf: float = 0.5):
+def run_detection_stream(model_path: str, tile_generator, conf: float = 0.6):
     """Fungsi lama — dipertahankan untuk kompatibilitas."""
     model = get_model(model_path)
     total = 0
